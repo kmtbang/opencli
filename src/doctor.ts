@@ -43,6 +43,8 @@ export type DoctorReport = {
   cliVersion?: string;
   envToken: string | null;
   envFingerprint: string | null;
+  extensionToken: string | null;
+  extensionFingerprint: string | null;
   shellFiles: ShellFileStatus[];
   configs: McpConfigStatus[];
   recommendedToken: string | null;
@@ -220,6 +222,163 @@ function readConfigStatus(filePath: string): McpConfigStatus {
   }
 }
 
+/**
+ * Discover the auth token stored by the Playwright MCP Bridge extension
+ * by scanning Chrome's LevelDB localStorage files directly.
+ *
+ * Uses `strings` + `grep` for fast binary scanning on macOS/Linux,
+ * with a pure-Node fallback on Windows.
+ */
+export function discoverExtensionToken(): string | null {
+  const home = os.homedir();
+  const platform = os.platform();
+  const bases: string[] = [];
+
+  if (platform === 'darwin') {
+    bases.push(
+      path.join(home, 'Library', 'Application Support', 'Google', 'Chrome'),
+      path.join(home, 'Library', 'Application Support', 'Google', 'Chrome Canary'),
+      path.join(home, 'Library', 'Application Support', 'Chromium'),
+      path.join(home, 'Library', 'Application Support', 'Microsoft Edge'),
+    );
+  } else if (platform === 'linux') {
+    bases.push(
+      path.join(home, '.config', 'google-chrome'),
+      path.join(home, '.config', 'chromium'),
+      path.join(home, '.config', 'microsoft-edge'),
+    );
+  } else if (platform === 'win32') {
+    const appData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+    bases.push(
+      path.join(appData, 'Google', 'Chrome', 'User Data'),
+      path.join(appData, 'Microsoft', 'Edge', 'User Data'),
+    );
+  }
+
+  const profiles = ['Default', 'Profile 1', 'Profile 2', 'Profile 3'];
+  // Token is 43 chars of base64url (from 32 random bytes)
+  const tokenRe = /([A-Za-z0-9_-]{40,50})/;
+
+  for (const base of bases) {
+    for (const profile of profiles) {
+      const dir = path.join(base, profile, 'Local Storage', 'leveldb');
+      if (!fileExists(dir)) continue;
+
+      // Fast path: use strings + grep to find candidate files and extract token
+      if (platform !== 'win32') {
+        const token = extractTokenViaStrings(dir, tokenRe);
+        if (token) return token;
+        continue;
+      }
+
+      // Slow path (Windows): read binary files directly
+      const token = extractTokenViaBinaryRead(dir, tokenRe);
+      if (token) return token;
+    }
+  }
+
+  return null;
+}
+
+function extractTokenViaStrings(dir: string, tokenRe: RegExp): string | null {
+  try {
+    // Step 1: Find files containing the extension ID
+    const { execSync } = require('node:child_process') as typeof import('node:child_process');
+    const grepResult = execSync(
+      `grep -rl '${PLAYWRIGHT_EXTENSION_ID}' "${dir}" 2>/dev/null | head -10`,
+      { encoding: 'utf-8', timeout: 5000 },
+    ).trim();
+    if (!grepResult) return null;
+
+    const candidateFiles = grepResult.split('\n').filter(Boolean);
+
+    for (const file of candidateFiles) {
+      // Step 2: Extract strings containing "auth-token" or the extension ID pattern
+      try {
+        const stringsOutput = execSync(
+          `strings "${file}" 2>/dev/null`,
+          { encoding: 'utf-8', timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
+        );
+
+        // Look for the token pattern near the extension ID + auth-token key
+        // LevelDB stores: "EXTENSION_ID.N\0...\0auth-token\0R\n...TOKEN_VALUE"
+        const lines = stringsOutput.split('\n');
+        let foundExtKey = false;
+        for (const line of lines) {
+          if (line.includes(PLAYWRIGHT_EXTENSION_ID)) foundExtKey = true;
+          if (foundExtKey && line.includes('auth-token')) {
+            // The token should appear in a nearby line
+            foundExtKey = false; // reset
+            continue;
+          }
+          if (foundExtKey || line.includes('auth-token')) {
+            const m = line.match(tokenRe);
+            if (m && validateBase64urlToken(m[1])) return m[1];
+          }
+        }
+
+        // Also try: look for token value after "EXTENSION_ID.N" pattern
+        const extKeyMatch = stringsOutput.match(
+          new RegExp(`${PLAYWRIGHT_EXTENSION_ID}\\.\\d[\\s\\S]{0,100}?${tokenRe.source}`),
+        );
+        if (extKeyMatch?.[1] && validateBase64urlToken(extKeyMatch[1])) return extKeyMatch[1];
+      } catch { continue; }
+    }
+  } catch {}
+  return null;
+}
+
+function extractTokenViaBinaryRead(dir: string, tokenRe: RegExp): string | null {
+  const extIdBuf = Buffer.from(PLAYWRIGHT_EXTENSION_ID);
+  const keyBuf = Buffer.from('auth-token');
+
+  let files: string[];
+  try {
+    files = fs.readdirSync(dir)
+      .filter(f => f.endsWith('.ldb') || f.endsWith('.log'))
+      .map(f => path.join(dir, f));
+  } catch { return null; }
+
+  // Sort by mtime descending
+  files.sort((a, b) => {
+    try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; } catch { return 0; }
+  });
+
+  for (const file of files) {
+    let data: Buffer;
+    try { data = fs.readFileSync(file); } catch { continue; }
+
+    // Quick check: does file contain both the extension ID and auth-token key?
+    const extPos = data.indexOf(extIdBuf);
+    if (extPos === -1) continue;
+    const keyPos = data.indexOf(keyBuf, Math.max(0, extPos - 500));
+    if (keyPos === -1) continue;
+
+    // Scan for token value after auth-token key
+    let idx = 0;
+    while (true) {
+      const kp = data.indexOf(keyBuf, idx);
+      if (kp === -1) break;
+
+      const contextStart = Math.max(0, kp - 500);
+      if (data.indexOf(extIdBuf, contextStart) !== -1 && data.indexOf(extIdBuf, contextStart) < kp) {
+        const after = data.subarray(kp + keyBuf.length, kp + keyBuf.length + 200).toString('latin1');
+        const m = after.match(tokenRe);
+        if (m && validateBase64urlToken(m[1])) return m[1];
+      }
+      idx = kp + 1;
+    }
+  }
+  return null;
+}
+
+function validateBase64urlToken(token: string): boolean {
+  try {
+    const b64 = token.replace(/-/g, '+').replace(/_/g, '/');
+    const decoded = Buffer.from(b64, 'base64');
+    return decoded.length >= 28 && decoded.length <= 36;
+  } catch { return false; }
+}
 
 
 export async function runBrowserDoctor(opts: DoctorOptions = {}): Promise<DoctorReport> {
@@ -234,19 +393,25 @@ export async function runBrowserDoctor(opts: DoctorOptions = {}): Promise<Doctor
   const configPaths = opts.configPaths?.length ? opts.configPaths : getDefaultMcpConfigPaths();
   const configs = configPaths.map(readConfigStatus);
 
+  // Try to discover the token directly from the Chrome extension's localStorage
+  const extensionToken = discoverExtensionToken();
+
   const allTokens = [
     opts.token ?? null,
+    extensionToken,
     envToken,
     ...shellFiles.map(s => s.token),
     ...configs.map(c => c.token),
   ].filter((v): v is string => !!v);
   const uniqueTokens = [...new Set(allTokens)];
-  const recommendedToken = opts.token ?? envToken ?? (uniqueTokens.length === 1 ? uniqueTokens[0] : null) ?? null;
+  const recommendedToken = opts.token ?? extensionToken ?? envToken ?? (uniqueTokens.length === 1 ? uniqueTokens[0] : null) ?? null;
 
   const report: DoctorReport = {
     cliVersion: opts.cliVersion,
     envToken,
     envFingerprint: getTokenFingerprint(envToken ?? undefined),
+    extensionToken,
+    extensionFingerprint: getTokenFingerprint(extensionToken ?? undefined),
     shellFiles,
     configs,
     recommendedToken,
@@ -270,6 +435,7 @@ export async function runBrowserDoctor(opts: DoctorOptions = {}): Promise<Doctor
 
 export function renderBrowserDoctorReport(report: DoctorReport): string {
   const tokenFingerprints = [
+    report.extensionFingerprint,
     report.envFingerprint,
     ...report.shellFiles.map(shell => shell.fingerprint),
     ...report.configs.filter(config => config.exists).map(config => config.fingerprint),
@@ -277,6 +443,9 @@ export function renderBrowserDoctorReport(report: DoctorReport): string {
   const uniqueFingerprints = [...new Set(tokenFingerprints)];
   const hasMismatch = uniqueFingerprints.length > 1;
   const lines = [`opencli v${report.cliVersion ?? 'unknown'} doctor`, ''];
+
+  const extStatus: ReportStatus = !report.extensionToken ? 'MISSING' : hasMismatch ? 'MISMATCH' : 'OK';
+  lines.push(statusLine(extStatus, `Extension token (Chrome LevelDB): ${tokenSummary(report.extensionToken, report.extensionFingerprint)}`));
 
   const envStatus: ReportStatus = !report.envToken ? 'MISSING' : hasMismatch ? 'MISMATCH' : 'OK';
   lines.push(statusLine(envStatus, `Environment token: ${tokenSummary(report.envToken, report.envFingerprint)}`));

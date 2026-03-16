@@ -90,6 +90,8 @@ describe('doctor report rendering', () => {
     const text = renderBrowserDoctorReport({
       envToken: 'abc123',
       envFingerprint: 'fp1',
+      extensionToken: 'abc123',
+      extensionFingerprint: 'fp1',
       shellFiles: [{ path: '/tmp/.zshrc', exists: true, token: 'abc123', fingerprint: 'fp1' }],
       configs: [{ path: '/tmp/mcp.json', exists: true, format: 'json', token: 'abc123', fingerprint: 'fp1', writable: true }],
       recommendedToken: 'abc123',
@@ -106,6 +108,8 @@ describe('doctor report rendering', () => {
     const text = renderBrowserDoctorReport({
       envToken: 'abc123',
       envFingerprint: 'fp1',
+      extensionToken: null,
+      extensionFingerprint: null,
       shellFiles: [{ path: '/tmp/.zshrc', exists: true, token: 'def456', fingerprint: 'fp2' }],
       configs: [{ path: '/tmp/mcp.json', exists: true, format: 'json', token: 'abc123', fingerprint: 'fp1', writable: true }],
       recommendedToken: 'abc123',
