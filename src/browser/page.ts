@@ -28,6 +28,12 @@ import {
   waitForDomStableJs,
 } from './dom-helpers.js';
 
+export function isRetryableSettleError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes('Inspected target navigated or closed')
+    || (message.includes('-32000') && message.toLowerCase().includes('target'));
+}
+
 /**
  * Page — implements IPage by talking to the daemon via HTTP.
  */
@@ -75,10 +81,27 @@ export class Page implements IPage {
     // settleMs is now a timeout cap (default 1000ms), not a fixed wait.
     if (options?.waitUntil !== 'none') {
       const maxMs = options?.settleMs ?? 1000;
-      await sendCommand('exec', {
+      const settleOpts = {
         code: waitForDomStableJs(maxMs, Math.min(500, maxMs)),
         ...this._cmdOpts(),
-      });
+      };
+      try {
+        await sendCommand('exec', settleOpts);
+      } catch (err) {
+        if (!isRetryableSettleError(err)) throw err;
+        // SPA client-side redirects can invalidate the CDP target after
+        // chrome.tabs reports 'complete'. Wait briefly for the new document
+        // to load, then retry the settle probe once.
+        try {
+          await new Promise((r) => setTimeout(r, 200));
+          await sendCommand('exec', settleOpts);
+        } catch (retryErr) {
+          if (!isRetryableSettleError(retryErr)) throw retryErr;
+          // Retry also failed — give up silently. Settle is best-effort
+          // after successful navigation; the next real command will surface
+          // any persistent target error immediately.
+        }
+      }
     }
   }
 
