@@ -336,30 +336,26 @@ function setWorkspaceSession(workspace: string, session: Pick<AutomationSession,
   });
 }
 
+type ResolvedTab = { tabId: number; tab: chrome.tabs.Tab | null };
+
 /**
- * Resolve target tab in the automation window.
- * If explicit tabId is given, use that directly.
- * Otherwise, find or create a tab in the dedicated automation window.
- * @param initialUrl — passed to getAutomationWindow for first-time window creation.
+ * Resolve target tab in the automation window, returning both the tabId and
+ * the Tab object (when available) so callers can skip a redundant chrome.tabs.get().
  */
-async function resolveTabId(tabId: number | undefined, workspace: string, initialUrl?: string): Promise<number> {
+async function resolveTab(tabId: number | undefined, workspace: string, initialUrl?: string): Promise<ResolvedTab> {
   // Even when an explicit tabId is provided, validate it is still debuggable.
-  // This prevents issues when extensions hijack the tab URL to chrome-extension://
-  // or when the tab has been closed by the user.
   if (tabId !== undefined) {
     try {
       const tab = await chrome.tabs.get(tabId);
       const session = automationSessions.get(workspace);
       const matchesSession = session ? tab.windowId === session.windowId : false;
-      if (isDebuggableUrl(tab.url) && matchesSession) return tabId;
+      if (isDebuggableUrl(tab.url) && matchesSession) return { tabId, tab };
       if (session && !matchesSession) {
         console.warn(`[opencli] Tab ${tabId} is not bound to workspace ${workspace}, re-resolving`);
       } else if (!isDebuggableUrl(tab.url)) {
-        // Tab exists but URL is not debuggable — fall through to auto-resolve
         console.warn(`[opencli] Tab ${tabId} URL is not debuggable (${tab.url}), re-resolving`);
       }
     } catch {
-      // Tab was closed — fall through to auto-resolve
       console.warn(`[opencli] Tab ${tabId} no longer exists, re-resolving`);
     }
   }
@@ -370,17 +366,16 @@ async function resolveTabId(tabId: number | undefined, workspace: string, initia
   // Prefer an existing debuggable tab
   const tabs = await chrome.tabs.query({ windowId });
   const debuggableTab = tabs.find(t => t.id && isDebuggableUrl(t.url));
-  if (debuggableTab?.id) return debuggableTab.id;
+  if (debuggableTab?.id) return { tabId: debuggableTab.id, tab: debuggableTab };
 
   // No debuggable tab — another extension may have hijacked the tab URL.
-  // Try to reuse by navigating to a data: URI (not interceptable by New Tab Override).
   const reuseTab = tabs.find(t => t.id);
   if (reuseTab?.id) {
     await chrome.tabs.update(reuseTab.id, { url: BLANK_PAGE });
     await new Promise(resolve => setTimeout(resolve, 300));
     try {
       const updated = await chrome.tabs.get(reuseTab.id);
-      if (isDebuggableUrl(updated.url)) return reuseTab.id;
+      if (isDebuggableUrl(updated.url)) return { tabId: reuseTab.id, tab: updated };
       console.warn(`[opencli] data: URI was intercepted (${updated.url}), creating fresh tab`);
     } catch {
       // Tab was closed during navigation
@@ -390,7 +385,13 @@ async function resolveTabId(tabId: number | undefined, workspace: string, initia
   // Fallback: create a new tab
   const newTab = await chrome.tabs.create({ windowId, url: BLANK_PAGE, active: true });
   if (!newTab.id) throw new Error('Failed to create tab in automation window');
-  return newTab.id;
+  return { tabId: newTab.id, tab: newTab };
+}
+
+/** Convenience wrapper returning just the tabId (used by most handlers) */
+async function resolveTabId(tabId: number | undefined, workspace: string, initialUrl?: string): Promise<number> {
+  const resolved = await resolveTab(tabId, workspace, initialUrl);
+  return resolved.tabId;
 }
 
 async function listAutomationTabs(workspace: string): Promise<chrome.tabs.Tab[]> {
@@ -427,9 +428,10 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
     return { id: cmd.id, ok: false, error: 'Blocked URL scheme -- only http:// and https:// are allowed' };
   }
   // Pass target URL so that first-time window creation can start on the right domain
-  const tabId = await resolveTabId(cmd.tabId, workspace, cmd.url);
+  const resolved = await resolveTab(cmd.tabId, workspace, cmd.url);
+  const tabId = resolved.tabId;
 
-  const beforeTab = await chrome.tabs.get(tabId);
+  const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
 

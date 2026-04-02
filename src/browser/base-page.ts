@@ -27,6 +27,8 @@ import { formatSnapshot } from '../snapshotFormatter.js';
 
 export abstract class BasePage implements IPage {
   protected _lastUrl: string | null = null;
+  /** Cached previous snapshot hashes for incremental diff marking */
+  private _prevSnapshotHashes: string | null = null;
 
   // ── Transport-specific methods (must be implemented by subclasses) ──
 
@@ -137,10 +139,19 @@ export abstract class BasePage implements IPage {
       maxTextLength: opts.maxTextLength ?? 120,
       includeScrollInfo: true,
       bboxDedup: true,
+      previousHashes: this._prevSnapshotHashes,
     });
 
     try {
-      return await this.evaluate(snapshotJs);
+      const result = await this.evaluate(snapshotJs);
+      // Read back the hashes stored by the snapshot for next diff
+      try {
+        const hashes = await this.evaluate('window.__opencli_prev_hashes') as string | null;
+        this._prevSnapshotHashes = typeof hashes === 'string' ? hashes : null;
+      } catch {
+        // Non-fatal: diff is best-effort
+      }
+      return result;
     } catch {
       return this._basicSnapshot(opts);
     }
