@@ -115,12 +115,16 @@ opencli operate keys "Enter"            # Press key (Enter, Escape, Tab, Control
 
 ### Wait
 
+Three variants — use the right one for the situation:
+
 ```bash
-opencli operate wait selector ".loaded"           # Wait for element
-opencli operate wait selector ".spinner" --timeout 5000  # With timeout
-opencli operate wait text "Success"               # Wait for text
-opencli operate wait time 3                       # Wait N seconds
+opencli operate wait time 3                       # Wait N seconds (fixed delay)
+opencli operate wait selector ".loaded"            # Wait until element appears in DOM
+opencli operate wait selector ".spinner" --timeout 5000  # With timeout (default 30s)
+opencli operate wait text "Success"                # Wait until text appears on page
 ```
+
+**When to wait**: After `open` on SPAs, after `click` that triggers async loading, before `eval` on dynamically rendered content.
 
 ### Extract (free & instant, read-only)
 
@@ -134,6 +138,16 @@ opencli operate eval "JSON.stringify([...document.querySelectorAll('h2')].map(e 
 opencli operate eval "(function(){ const items = [...document.querySelectorAll('.item')]; return JSON.stringify(items.map(e => e.textContent)); })()"
 ```
 
+**Selector safety**: Always use fallback selectors — `querySelector` returns `null` on miss:
+```bash
+# BAD: crashes if selector misses
+opencli operate eval "document.querySelector('.title').textContent"
+
+# GOOD: fallback with || or ?.
+opencli operate eval "(document.querySelector('.title') || document.querySelector('h1') || {textContent:''}).textContent"
+opencli operate eval "document.querySelector('.title')?.textContent ?? 'not found'"
+```
+
 ### Network (API Discovery)
 
 ```bash
@@ -145,9 +159,13 @@ opencli operate network --all            # Include static resources
 ### Sedimentation (Save as CLI)
 
 ```bash
-opencli operate init hn/top              # Generate adapter scaffold
-opencli operate verify hn/top            # Test the adapter
+opencli operate init hn/top              # Generate adapter scaffold at ~/.opencli/clis/hn/top.ts
+opencli operate verify hn/top            # Test the adapter (adds --limit 3 only if `limit` arg is defined)
 ```
+
+- `init` auto-detects the domain from the active browser session (no need to specify it)
+- `init` creates the file + populates `site`, `name`, `domain`, and `columns` from current page
+- `verify` runs the adapter end-to-end and prints output; if no `limit` arg exists in the adapter, it won't pass `--limit 3`
 
 ### Session
 
@@ -251,6 +269,32 @@ Save to `~/.opencli/clis/<site>/<command>.ts` → immediately available as `open
 3. **Use `eval` for data extraction** — `eval "JSON.stringify(...)"` is faster than multiple `get` calls
 4. **Use `network` to find APIs** — JSON APIs are more reliable than DOM scraping
 5. **Alias**: `opencli op` is shorthand for `opencli operate`
+
+## Common Pitfalls
+
+1. **`form.submit()` fails in automation** — Don't use `form.submit()` or `eval` to submit forms. Navigate directly to the search URL instead:
+   ```bash
+   # BAD: form.submit() often silently fails
+   opencli operate eval "document.querySelector('form').submit()"
+   # GOOD: construct the URL and navigate
+   opencli operate open "https://github.com/search?q=opencli&type=repositories"
+   ```
+
+2. **GitHub DOM changes frequently** — Prefer `data-testid` attributes when available; they are more stable than class names or tag structure.
+
+3. **SPA pages need `wait` before extraction** — After `open` or `click` on single-page apps, the DOM isn't ready immediately. Always `wait selector` or `wait text` before `eval`.
+
+4. **Use `state` before clicking** — Run `opencli operate state` to inspect available interactive elements and their indices. Never guess indices from memory.
+
+5. **`evaluate` runs in browser context** — `page.evaluate()` in adapters executes inside the browser. Node.js APIs (`fs`, `path`, `process`) are NOT available. Use `fetch()` for network calls, DOM APIs for page data.
+
+6. **Backticks in `page.evaluate` break JSON storage** — When writing adapters that will be stored/transported as JSON, avoid template literals inside `page.evaluate`. Use string concatenation or function-style evaluate:
+   ```typescript
+   // BAD: template literal backticks break when adapter is in JSON
+   page.evaluate(`document.querySelector("${selector}")`)
+   // GOOD: function-style evaluate
+   page.evaluate((sel) => document.querySelector(sel), selector)
+   ```
 
 ## Troubleshooting
 
